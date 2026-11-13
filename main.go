@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -178,9 +179,40 @@ type ViolationsHistoryResponse struct {
 	TimeNs     string      `json:"time_ns"`
 }
 
+// getEnv reads an environment variable, falling back to a default for local (non-Docker) runs.
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// corsMiddleware allows the frontend (on a different origin once deployed) to call the API.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
-	// 3. Connect to the local Docker PostgreSQL database
-	connStr := "user=postgres password=root dbname=geofence_db sslmode=disable host=localhost port=5432"
+	// 3. Connect to PostgreSQL. Defaults match docker-compose for local dev;
+	// override via env vars when deploying.
+	connStr := fmt.Sprintf(
+		"user=%s password=%s dbname=%s sslmode=%s host=%s port=%s",
+		getEnv("DB_USER", "postgres"),
+		getEnv("DB_PASSWORD", "root"),
+		getEnv("DB_NAME", "geofence_db"),
+		getEnv("DB_SSLMODE", "disable"),
+		getEnv("DB_HOST", "localhost"),
+		getEnv("DB_PORT", "5432"),
+	)
 	var err error
 
 	db, err = sql.Open("postgres", connStr)
@@ -190,9 +222,19 @@ func main() {
 	// defer ensures the connection closes when the server stops running
 	defer db.Close()
 
-	// Verify the connection is actually alive
-	if err = db.Ping(); err != nil {
-		log.Fatal("Database is unreachable: ", err)
+	// Retry the initial connection: Postgres (especially on first boot, while it
+	// runs docker-entrypoint-initdb.d scripts) can report healthy and then briefly
+	// restart, so a single Ping() right at container startup can race it.
+	maxAttempts := 10
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err = db.Ping(); err == nil {
+			break
+		}
+		log.Printf("Database not ready yet (attempt %d/%d): %v\n", attempt, maxAttempts, err)
+		if attempt == maxAttempts {
+			log.Fatal("Database is unreachable: ", err)
+		}
+		time.Sleep(3 * time.Second)
 	}
 	fmt.Println("Connected to PostGIS successfully!")
 
@@ -226,9 +268,10 @@ func main() {
 	// Bind the WebSocket endpoint
 	router.HandleFunc("/ws", wsHandler)
 
-	// 5. Start the HTTP server on port 8080
-	fmt.Println("Server running on http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", router))
+	// 5. Start the HTTP server
+	port := getEnv("PORT", "8080")
+	fmt.Printf("Server running on http://localhost:%s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, corsMiddleware(router)))
 }
 
 // Handler function for POST /vehicles
@@ -467,22 +510,52 @@ func updateLocationHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Store the location in the database using PostGIS ST_SetSRID and ST_MakePoint
+	var vehicleNumber string
+	db.QueryRow("SELECT vehicle_number FROM vehicles WHERE id = $1", req.VehicleID).Scan(&vehicleNumber)
+
+	// 2. Find which geofences the vehicle was inside BEFORE this update, based on
+	// its most recent previously-recorded location (needed to detect "exit" events).
+	previousGeofences := make(map[string]bool)
+	var prevLat, prevLng sql.NullFloat64
+	err := db.QueryRow(`
+		SELECT ST_Y(location), ST_X(location)
+		FROM vehicle_locations
+		WHERE vehicle_id = $1
+		ORDER BY recorded_at DESC
+		LIMIT 1
+	`, req.VehicleID).Scan(&prevLat, &prevLng)
+	if err == nil && prevLat.Valid && prevLng.Valid {
+		prevRows, perr := db.Query(`
+			SELECT id FROM geofences
+			WHERE ST_Contains(boundaries, ST_SetSRID(ST_MakePoint($1, $2), 4326))
+		`, prevLng.Float64, prevLat.Float64)
+		if perr == nil {
+			for prevRows.Next() {
+				var gid string
+				if prevRows.Scan(&gid) == nil {
+					previousGeofences[gid] = true
+				}
+			}
+			prevRows.Close()
+		}
+	}
+
+	// 3. Store the new location in the database using PostGIS ST_SetSRID and ST_MakePoint
 	insertQuery := `
 		INSERT INTO vehicle_locations (vehicle_id, location, recorded_at)
 		VALUES ($1, ST_SetSRID(ST_MakePoint($2, $3), 4326), $4)
 	`
-	_, err := db.Exec(insertQuery, req.VehicleID, req.Longitude, req.Latitude, req.Timestamp)
+	_, err = db.Exec(insertQuery, req.VehicleID, req.Longitude, req.Latitude, req.Timestamp)
 	if err != nil {
 		log.Printf("Location Insert Error: %v\n", err)
 		http.Error(w, "Failed to save location", http.StatusInternalServerError)
 		return
 	}
 
-	// 3. The Core Geospatial Query: Check which geofences this point is currently inside
+	// 4. The Core Geospatial Query: Check which geofences this point is currently inside
 	checkQuery := `
-		SELECT id, name 
-		FROM geofences 
+		SELECT id, name
+		FROM geofences
 		WHERE ST_Contains(boundaries, ST_SetSRID(ST_MakePoint($1, $2), 4326))
 	`
 	rows, err := db.Query(checkQuery, req.Longitude, req.Latitude)
@@ -493,8 +566,9 @@ func updateLocationHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	// 4. Initialize an empty slice for our current geofences
+	// 5. Initialize an empty slice for our current geofences
 	activeGeofences := []CurrentGeofence{}
+	currentGeofences := make(map[string]bool)
 
 	for rows.Next() {
 		var cg CurrentGeofence
@@ -503,59 +577,73 @@ func updateLocationHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		cg.Status = "inside"
 		activeGeofences = append(activeGeofences, cg)
+		currentGeofences[cg.GeofenceID] = true
 	}
 
-	// --- NEW LIVE ALERT LOGIC STARTS HERE ---
+	// 6. Diff previous vs. current geofences to find entries (newly inside) and exits (just left)
+	enteredGeofences := make(map[string]bool)
+	for gid := range currentGeofences {
+		if !previousGeofences[gid] {
+			enteredGeofences[gid] = true
+		}
+	}
+	exitedGeofences := make(map[string]bool)
+	for gid := range previousGeofences {
+		if !currentGeofences[gid] {
+			exitedGeofences[gid] = true
+		}
+	}
+
+	// --- LIVE ALERT LOGIC: fire entry/exit alerts for any matching active rule ---
 
 	rulesQuery := `
-		SELECT id, geofence_id, event_type 
-		FROM alert_rules 
-		WHERE status = 'active' AND (vehicle_id = $1 OR vehicle_id = '' OR vehicle_id IS NULL)
+		SELECT ar.id, ar.geofence_id, ar.event_type, g.name
+		FROM alert_rules ar
+		JOIN geofences g ON ar.geofence_id = g.id
+		WHERE ar.status = 'active' AND (ar.vehicle_id = $1 OR ar.vehicle_id = '' OR ar.vehicle_id IS NULL)
 	`
 	ruleRows, err := db.Query(rulesQuery, req.VehicleID)
 	if err == nil {
 		defer ruleRows.Close()
 
 		for ruleRows.Next() {
-			var ruleID, ruleGeoID, eventType string
-			ruleRows.Scan(&ruleID, &ruleGeoID, &eventType)
+			var ruleID, ruleGeoID, eventType, geoName string
+			ruleRows.Scan(&ruleID, &ruleGeoID, &eventType, &geoName)
 
-			isInside := false
-			var currentGeoName string
-			for _, cg := range activeGeofences {
-				if cg.GeofenceID == ruleGeoID {
-					isInside = true
-					currentGeoName = cg.GeofenceName
-					break
-				}
+			firedEventType := ""
+			if enteredGeofences[ruleGeoID] && (eventType == "entry" || eventType == "both") {
+				firedEventType = "entry"
+			} else if exitedGeofences[ruleGeoID] && (eventType == "exit" || eventType == "both") {
+				firedEventType = "exit"
+			}
+			if firedEventType == "" {
+				continue
 			}
 
-			if isInside && (eventType == "entry" || eventType == "both") {
+			violationID := "viol_" + uuid.New().String()[:8]
 
-				violationID := "viol_" + uuid.New().String()[:8]
+			insertViol := `
+				INSERT INTO violations (id, vehicle_id, geofence_id, event_type, latitude, longitude, timestamp)
+				VALUES ($1, $2, $3, $4, $5, $6, $7)
+			`
+			db.Exec(insertViol, violationID, req.VehicleID, ruleGeoID, firedEventType, req.Latitude, req.Longitude, req.Timestamp)
 
-				insertViol := `
-					INSERT INTO violations (id, vehicle_id, geofence_id, event_type, latitude, longitude, timestamp)
-					VALUES ($1, $2, $3, $4, $5, $6, $7)
-				`
-				db.Exec(insertViol, violationID, req.VehicleID, ruleGeoID, "entry", req.Latitude, req.Longitude, req.Timestamp)
-
-				alertPayload := Violation{
-					ID:           violationID,
-					VehicleID:    req.VehicleID,
-					GeofenceID:   ruleGeoID,
-					GeofenceName: currentGeoName,
-					EventType:    "entry",
-					Latitude:     req.Latitude,
-					Longitude:    req.Longitude,
-					Timestamp:    req.Timestamp,
-				}
-
-				go broadcastAlert(alertPayload)
+			alertPayload := Violation{
+				ID:            violationID,
+				VehicleID:     req.VehicleID,
+				VehicleNumber: vehicleNumber,
+				GeofenceID:    ruleGeoID,
+				GeofenceName:  geoName,
+				EventType:     firedEventType,
+				Latitude:      req.Latitude,
+				Longitude:     req.Longitude,
+				Timestamp:     req.Timestamp,
 			}
+
+			go broadcastAlert(alertPayload)
 		}
 	}
-	// --- NEW LIVE ALERT LOGIC ENDS HERE ---
+	// --- END LIVE ALERT LOGIC ---
 
 	// 5. Calculate execution time
 	duration := time.Since(startTime).Nanoseconds()
